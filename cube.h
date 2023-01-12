@@ -1,0 +1,814 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/sysmacros.h>
+#include <sys/stat.h>
+#include <signal.h>
+#include <linux/kd.h>
+#include <linux/vt.h>
+#include <linux/major.h>
+#include <termios.h>
+#include <poll.h>
+#include <math.h>
+#include <assert.h>
+#include <sys/mman.h>
+#include <linux/input.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <xcb/xcb.h>
+#include <vulkan/vulkan.h>
+#include <vulkan/vulkan_xcb.h>
+#include <string.h>
+
+#define MAX_NUM_IMAGES 5
+
+static uint32_t vs_spirv_source[] = {
+#include "vert.spv.shad"
+};
+
+static uint32_t fs_spirv_source[] = {
+#include "frag.spv.shad"
+};
+
+
+typedef struct
+{
+    float   m[4][4];
+} ESMatrix;
+
+#include <math.h>
+#include <string.h>
+
+#define PI 3.1415926535897932384626433832795f
+
+void
+esScale(ESMatrix *result, float sx, float sy, float sz)
+{
+    result->m[0][0] *= sx;
+    result->m[0][1] *= sx;
+    result->m[0][2] *= sx;
+    result->m[0][3] *= sx;
+
+    result->m[1][0] *= sy;
+    result->m[1][1] *= sy;
+    result->m[1][2] *= sy;
+    result->m[1][3] *= sy;
+
+    result->m[2][0] *= sz;
+    result->m[2][1] *= sz;
+    result->m[2][2] *= sz;
+    result->m[2][3] *= sz;
+}
+
+void
+esTranslate(ESMatrix *result, float tx, float ty, float tz)
+{
+    result->m[3][0] += (result->m[0][0] * tx + result->m[1][0] * ty + result->m[2][0] * tz);
+    result->m[3][1] += (result->m[0][1] * tx + result->m[1][1] * ty + result->m[2][1] * tz);
+    result->m[3][2] += (result->m[0][2] * tx + result->m[1][2] * ty + result->m[2][2] * tz);
+    result->m[3][3] += (result->m[0][3] * tx + result->m[1][3] * ty + result->m[2][3] * tz);
+}
+
+void
+esRotate(ESMatrix *result, float angle, float x, float y, float z)
+{
+   float sinAngle, cosAngle;
+   float mag = sqrtf(x * x + y * y + z * z);
+      
+   sinAngle = sinf ( angle * PI / 180.0f );
+   cosAngle = cosf ( angle * PI / 180.0f );
+   if ( mag > 0.0f )
+   {
+      float xx, yy, zz, xy, yz, zx, xs, ys, zs;
+      float oneMinusCos;
+      ESMatrix rotMat;
+   
+      x /= mag;
+      y /= mag;
+      z /= mag;
+
+      xx = x * x;
+      yy = y * y;
+      zz = z * z;
+      xy = x * y;
+      yz = y * z;
+      zx = z * x;
+      xs = x * sinAngle;
+      ys = y * sinAngle;
+      zs = z * sinAngle;
+      oneMinusCos = 1.0f - cosAngle;
+
+      rotMat.m[0][0] = (oneMinusCos * xx) + cosAngle;
+      rotMat.m[0][1] = (oneMinusCos * xy) - zs;
+      rotMat.m[0][2] = (oneMinusCos * zx) + ys;
+      rotMat.m[0][3] = 0.0F; 
+
+      rotMat.m[1][0] = (oneMinusCos * xy) + zs;
+      rotMat.m[1][1] = (oneMinusCos * yy) + cosAngle;
+      rotMat.m[1][2] = (oneMinusCos * yz) - xs;
+      rotMat.m[1][3] = 0.0F;
+
+      rotMat.m[2][0] = (oneMinusCos * zx) - ys;
+      rotMat.m[2][1] = (oneMinusCos * yz) + xs;
+      rotMat.m[2][2] = (oneMinusCos * zz) + cosAngle;
+      rotMat.m[2][3] = 0.0F; 
+
+      rotMat.m[3][0] = 0.0F;
+      rotMat.m[3][1] = 0.0F;
+      rotMat.m[3][2] = 0.0F;
+      rotMat.m[3][3] = 1.0F;
+
+      esMatrixMultiply( result, &rotMat, result );
+   }
+}
+
+void
+esFrustum(ESMatrix *result, float left, float right, float bottom, float top, float nearZ, float farZ)
+{
+    float       deltaX = right - left;
+    float       deltaY = top - bottom;
+    float       deltaZ = farZ - nearZ;
+    ESMatrix    frust;
+
+    if ( (nearZ <= 0.0f) || (farZ <= 0.0f) ||
+         (deltaX <= 0.0f) || (deltaY <= 0.0f) || (deltaZ <= 0.0f) )
+         return;
+
+    frust.m[0][0] = 2.0f * nearZ / deltaX;
+    frust.m[0][1] = frust.m[0][2] = frust.m[0][3] = 0.0f;
+
+    frust.m[1][1] = 2.0f * nearZ / deltaY;
+    frust.m[1][0] = frust.m[1][2] = frust.m[1][3] = 0.0f;
+
+    frust.m[2][0] = (right + left) / deltaX;
+    frust.m[2][1] = (top + bottom) / deltaY;
+    frust.m[2][2] = -farZ / deltaZ;
+    frust.m[2][3] = -1.0f;
+
+    frust.m[3][2] = -(nearZ * farZ) / deltaZ;
+    frust.m[3][0] = frust.m[3][1] = frust.m[3][3] = 0.0f;
+
+    esMatrixMultiply(result, &frust, result);
+}
+
+
+void 
+esPerspective(ESMatrix *result, float fovy, float aspect, float nearZ, float farZ)
+{
+   float frustumW, frustumH;
+   
+   frustumH = tanf( fovy / 360.0f * PI ) * nearZ;
+   frustumW = frustumH * aspect;
+
+   esFrustum( result, -frustumW, frustumW, -frustumH, frustumH, nearZ, farZ );
+}
+
+void
+esOrtho(ESMatrix *result, float left, float right, float bottom, float top, float nearZ, float farZ)
+{
+    float       deltaX = right - left;
+    float       deltaY = top - bottom;
+    float       deltaZ = farZ - nearZ;
+    ESMatrix    ortho;
+
+    if ( (deltaX == 0.0f) || (deltaY == 0.0f) || (deltaZ == 0.0f) )
+        return;
+
+    esMatrixLoadIdentity(&ortho);
+    ortho.m[0][0] = 2.0f / deltaX;
+    ortho.m[3][0] = -(right + left) / deltaX;
+    ortho.m[1][1] = 2.0f / deltaY;
+    ortho.m[3][1] = -(top + bottom) / deltaY;
+    ortho.m[2][2] = -1.0f / deltaZ;
+    ortho.m[3][2] = -nearZ / deltaZ;
+
+    esMatrixMultiply(result, &ortho, result);
+}
+
+
+void
+esMatrixMultiply(ESMatrix *result, ESMatrix *srcA, ESMatrix *srcB)
+{
+    ESMatrix    tmp;
+    int         i;
+
+	for (i=0; i<4; i++)
+	{
+		tmp.m[i][0] =	(srcA->m[i][0] * srcB->m[0][0]) +
+						(srcA->m[i][1] * srcB->m[1][0]) +
+						(srcA->m[i][2] * srcB->m[2][0]) +
+						(srcA->m[i][3] * srcB->m[3][0]) ;
+
+		tmp.m[i][1] =	(srcA->m[i][0] * srcB->m[0][1]) + 
+						(srcA->m[i][1] * srcB->m[1][1]) +
+						(srcA->m[i][2] * srcB->m[2][1]) +
+						(srcA->m[i][3] * srcB->m[3][1]) ;
+
+		tmp.m[i][2] =	(srcA->m[i][0] * srcB->m[0][2]) + 
+						(srcA->m[i][1] * srcB->m[1][2]) +
+						(srcA->m[i][2] * srcB->m[2][2]) +
+						(srcA->m[i][3] * srcB->m[3][2]) ;
+
+		tmp.m[i][3] =	(srcA->m[i][0] * srcB->m[0][3]) + 
+						(srcA->m[i][1] * srcB->m[1][3]) +
+						(srcA->m[i][2] * srcB->m[2][3]) +
+						(srcA->m[i][3] * srcB->m[3][3]) ;
+	}
+    memcpy(result, &tmp, sizeof(ESMatrix));
+}
+
+
+void
+esMatrixLoadIdentity(ESMatrix *result)
+{
+    memset(result, 0x0, sizeof(ESMatrix));
+    result->m[0][0] = 1.0f;
+    result->m[1][1] = 1.0f;
+    result->m[2][2] = 1.0f;
+    result->m[3][3] = 1.0f;
+}
+
+
+struct ubo {
+   ESMatrix modelview;
+   ESMatrix modelviewprojection;
+   float normal[12];
+};
+
+struct vkcube;
+
+static inline bool
+streq(const char *a, const char *b)
+{
+   return strcmp(a, b) == 0;
+}
+
+struct vkcube_buffer {
+   struct gbm_bo *gbm_bo;
+   VkDeviceMemory mem;
+   VkImage image;
+   VkImageView view;
+   VkFramebuffer framebuffer;
+   VkFence fence;
+   VkCommandBuffer cmd_buffer;
+
+   uint32_t fb;
+   uint32_t stride;
+};
+
+struct model {
+   void (*init)(struct vkcube *vc);
+   void (*render)(struct vkcube *vc, struct vkcube_buffer *b, bool wait_semaphore);
+};
+
+struct vkcube 
+{
+	struct model model;
+
+	bool protected_en;
+
+	int fd;
+	struct gbm_device *gbm_device;
+
+	struct {
+		xcb_connection_t *conn;
+		xcb_window_t window;
+		xcb_atom_t atom_wm_protocols;
+		xcb_atom_t atom_wm_delete_window;
+	} xcb;
+
+	struct {
+		VkDisplayModeKHR display_mode;
+	} khr;
+
+	VkSwapchainKHR swap_chain;
+
+	//    drmModeCrtc *crtc;
+	//    drmModeConnector *connector;
+	uint32_t width, height;
+
+	VkInstance instance;
+	VkPhysicalDevice physical_device;
+	VkPhysicalDeviceMemoryProperties memory_properties;
+	VkDevice device;
+	VkRenderPass render_pass;
+	VkQueue queue;
+	VkPipelineLayout pipeline_layout;
+	VkPipeline pipeline;
+	VkDeviceMemory mem;
+	VkBuffer buffer;
+	VkDescriptorSet descriptor_set;
+	VkSemaphore semaphore;
+	VkCommandPool cmd_pool;
+
+	void *map;
+	uint32_t vertex_offset, colors_offset, normals_offset;
+
+	struct timeval start_tv;
+	VkSurfaceKHR surface;
+	VkFormat image_format;
+	struct vkcube_buffer buffers[MAX_NUM_IMAGES];
+	uint32_t image_count;
+	int current;
+};
+
+static int find_host_coherent_memory(struct vkcube *vc, unsigned allowed)
+{
+    for (unsigned i = 0; (1u << i) <= allowed && i <= vc->memory_properties.memoryTypeCount; ++i) {
+        if ((allowed & (1u << i)) &&
+            (vc->memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+            (vc->memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+            return i;
+    }
+    return -1;
+}
+
+static void
+init_cube(struct vkcube *vc)
+{
+   VkResult r;
+
+   VkDescriptorSetLayout set_layout;
+   vkCreateDescriptorSetLayout(vc->device,
+                               &(VkDescriptorSetLayoutCreateInfo) {
+                                  .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                  .bindingCount = 1,
+                                  .pBindings = (VkDescriptorSetLayoutBinding[]) {
+                                     {
+                                        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                        .descriptorCount = 1,
+                                        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+                                        .pImmutableSamplers = NULL
+                                     }
+                                  }
+                               },
+                               NULL,
+                               &set_layout);
+
+   vkCreatePipelineLayout(vc->device,
+                          &(VkPipelineLayoutCreateInfo) {
+                             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                             .setLayoutCount = 1,
+                             .pSetLayouts = &set_layout,
+                          },
+                          NULL,
+                          &vc->pipeline_layout);
+
+   VkPipelineVertexInputStateCreateInfo vi_create_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+      .vertexBindingDescriptionCount = 3,
+      .pVertexBindingDescriptions = (VkVertexInputBindingDescription[]) {
+         {
+            .binding = 0,
+            .stride = 3 * sizeof(float),
+            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX
+         },
+         {
+            .binding = 1,
+            .stride = 3 * sizeof(float),
+            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX
+         },
+         {
+            .binding = 2,
+            .stride = 3 * sizeof(float),
+            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX
+         }
+      },
+      .vertexAttributeDescriptionCount = 3,
+      .pVertexAttributeDescriptions = (VkVertexInputAttributeDescription[]) {
+         {
+            .location = 0,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32B32_SFLOAT,
+            .offset = 0
+         },
+         {
+            .location = 1,
+            .binding = 1,
+            .format = VK_FORMAT_R32G32B32_SFLOAT,
+            .offset = 0
+         },
+         {
+            .location = 2,
+            .binding = 2,
+            .format = VK_FORMAT_R32G32B32_SFLOAT,
+            .offset = 0
+         }
+      }
+   };
+
+   VkShaderModule vs_module;
+   vkCreateShaderModule(vc->device,
+                        &(VkShaderModuleCreateInfo) {
+                           .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                           .codeSize = sizeof(vs_spirv_source),
+                           .pCode = (uint32_t *)vs_spirv_source,
+                        },
+                        NULL,
+                        &vs_module);
+
+   VkShaderModule fs_module;
+   vkCreateShaderModule(vc->device,
+                        &(VkShaderModuleCreateInfo) {
+                           .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                           .codeSize = sizeof(fs_spirv_source),
+                           .pCode = (uint32_t *)fs_spirv_source,
+                        },
+                        NULL,
+                        &fs_module);
+
+   vkCreateGraphicsPipelines(vc->device,
+      (VkPipelineCache) { VK_NULL_HANDLE },
+      1,
+      &(VkGraphicsPipelineCreateInfo) {
+         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+         .stageCount = 2,
+         .pStages = (VkPipelineShaderStageCreateInfo[]) {
+             {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                .module = vs_module,
+                .pName = "main",
+             },
+             {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .module = fs_module,
+                .pName = "main",
+             },
+         },
+         .pVertexInputState = &vi_create_info,
+         .pInputAssemblyState = &(VkPipelineInputAssemblyStateCreateInfo) {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+            .primitiveRestartEnable = false,
+         },
+
+         .pViewportState = &(VkPipelineViewportStateCreateInfo) {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            .viewportCount = 1,
+            .scissorCount = 1,
+         },
+
+         .pRasterizationState = &(VkPipelineRasterizationStateCreateInfo) {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            .rasterizerDiscardEnable = false,
+            .polygonMode = VK_POLYGON_MODE_FILL,
+            .cullMode = VK_CULL_MODE_BACK_BIT,
+            .frontFace = VK_FRONT_FACE_CLOCKWISE,
+            .lineWidth = 1.0f,
+         },
+
+         .pMultisampleState = &(VkPipelineMultisampleStateCreateInfo) {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            .rasterizationSamples = 1,
+         },
+         .pDepthStencilState = &(VkPipelineDepthStencilStateCreateInfo) {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO
+         },
+
+         .pColorBlendState = &(VkPipelineColorBlendStateCreateInfo) {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            .attachmentCount = 1,
+            .pAttachments = (VkPipelineColorBlendAttachmentState []) {
+               { .colorWriteMask = VK_COLOR_COMPONENT_A_BIT |
+                                   VK_COLOR_COMPONENT_R_BIT |
+                                   VK_COLOR_COMPONENT_G_BIT |
+                                   VK_COLOR_COMPONENT_B_BIT },
+            }
+         },
+
+         .pDynamicState = &(VkPipelineDynamicStateCreateInfo) {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            .dynamicStateCount = 2,
+            .pDynamicStates = (VkDynamicState[]) {
+                VK_DYNAMIC_STATE_VIEWPORT,
+                VK_DYNAMIC_STATE_SCISSOR,
+            },
+         },
+
+         .flags = 0,
+         .layout = vc->pipeline_layout,
+         .renderPass = vc->render_pass,
+         .subpass = 0,
+         .basePipelineHandle = (VkPipeline) { 0 },
+         .basePipelineIndex = 0
+      },
+      NULL,
+      &vc->pipeline);
+
+   static const float vVertices[] = {
+      // front
+      -1.0f, -1.0f, +1.0f, // point blue
+      +1.0f, -1.0f, +1.0f, // point magenta
+      -1.0f, +1.0f, +1.0f, // point cyan
+      +1.0f, +1.0f, +1.0f, // point white
+      // back
+      +1.0f, -1.0f, -1.0f, // point red
+      -1.0f, -1.0f, -1.0f, // point black
+      +1.0f, +1.0f, -1.0f, // point yellow
+      -1.0f, +1.0f, -1.0f, // point green
+      // right
+      +1.0f, -1.0f, +1.0f, // point magenta
+      +1.0f, -1.0f, -1.0f, // point red
+      +1.0f, +1.0f, +1.0f, // point white
+      +1.0f, +1.0f, -1.0f, // point yellow
+      // left
+      -1.0f, -1.0f, -1.0f, // point black
+      -1.0f, -1.0f, +1.0f, // point blue
+      -1.0f, +1.0f, -1.0f, // point green
+      -1.0f, +1.0f, +1.0f, // point cyan
+      // top
+      -1.0f, +1.0f, +1.0f, // point cyan
+      +1.0f, +1.0f, +1.0f, // point white
+      -1.0f, +1.0f, -1.0f, // point green
+      +1.0f, +1.0f, -1.0f, // point yellow
+      // bottom
+      -1.0f, -1.0f, -1.0f, // point black
+      +1.0f, -1.0f, -1.0f, // point red
+      -1.0f, -1.0f, +1.0f, // point blue
+      +1.0f, -1.0f, +1.0f  // point magenta
+   };
+
+   static const float vColors[] = {
+      // front
+      0.0f,  0.0f,  1.0f, // blue
+      1.0f,  0.0f,  1.0f, // magenta
+      0.0f,  1.0f,  1.0f, // cyan
+      1.0f,  1.0f,  1.0f, // white
+      // back
+      1.0f,  0.0f,  0.0f, // red
+      0.0f,  0.0f,  0.0f, // black
+      1.0f,  1.0f,  0.0f, // yellow
+      0.0f,  1.0f,  0.0f, // green
+      // right
+      1.0f,  0.0f,  1.0f, // magenta
+      1.0f,  0.0f,  0.0f, // red
+      1.0f,  1.0f,  1.0f, // white
+      1.0f,  1.0f,  0.0f, // yellow
+      // left
+      0.0f,  0.0f,  0.0f, // black
+      0.0f,  0.0f,  1.0f, // blue
+      0.0f,  1.0f,  0.0f, // green
+      0.0f,  1.0f,  1.0f, // cyan
+      // top
+      0.0f,  1.0f,  1.0f, // cyan
+      1.0f,  1.0f,  1.0f, // white
+      0.0f,  1.0f,  0.0f, // green
+      1.0f,  1.0f,  0.0f, // yellow
+      // bottom
+      0.0f,  0.0f,  0.0f, // black
+      1.0f,  0.0f,  0.0f, // red
+      0.0f,  0.0f,  1.0f, // blue
+      1.0f,  0.0f,  1.0f  // magenta
+   };
+
+   static const float vNormals[] = {
+      // front
+      +0.0f, +0.0f, +1.0f, // forward
+      +0.0f, +0.0f, +1.0f, // forward
+      +0.0f, +0.0f, +1.0f, // forward
+      +0.0f, +0.0f, +1.0f, // forward
+      // back
+      +0.0f, +0.0f, -1.0f, // backbard
+      +0.0f, +0.0f, -1.0f, // backbard
+      +0.0f, +0.0f, -1.0f, // backbard
+      +0.0f, +0.0f, -1.0f, // backbard
+      // right
+      +1.0f, +0.0f, +0.0f, // right
+      +1.0f, +0.0f, +0.0f, // right
+      +1.0f, +0.0f, +0.0f, // right
+      +1.0f, +0.0f, +0.0f, // right
+      // left
+      -1.0f, +0.0f, +0.0f, // left
+      -1.0f, +0.0f, +0.0f, // left
+      -1.0f, +0.0f, +0.0f, // left
+      -1.0f, +0.0f, +0.0f, // left
+      // top
+      +0.0f, +1.0f, +0.0f, // up
+      +0.0f, +1.0f, +0.0f, // up
+      +0.0f, +1.0f, +0.0f, // up
+      +0.0f, +1.0f, +0.0f, // up
+      // bottom
+      +0.0f, -1.0f, +0.0f, // down
+      +0.0f, -1.0f, +0.0f, // down
+      +0.0f, -1.0f, +0.0f, // down
+      +0.0f, -1.0f, +0.0f  // down
+   };
+
+   vc->vertex_offset = sizeof(struct ubo);
+   vc->colors_offset = vc->vertex_offset + sizeof(vVertices);
+   vc->normals_offset = vc->colors_offset + sizeof(vColors);
+   uint32_t mem_size = vc->normals_offset + sizeof(vNormals);
+
+   vkCreateBuffer(vc->device,
+                  &(VkBufferCreateInfo) {
+                     .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                     .size = mem_size,
+                     .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                              VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     .flags = 0
+                  },
+                  NULL,
+                  &vc->buffer);
+
+   VkMemoryRequirements reqs;
+   vkGetBufferMemoryRequirements(vc->device, vc->buffer, &reqs);
+
+   int memory_type = find_host_coherent_memory(vc, reqs.memoryTypeBits);
+   if (memory_type < 0)
+   {
+		exit("find_host_coherent_memory failed");
+   }
+    //   fail("find_host_coherent_memory failed");
+
+   vkAllocateMemory(vc->device,
+                    &(VkMemoryAllocateInfo) {
+                       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                       .allocationSize = mem_size,
+                       .memoryTypeIndex = memory_type,
+                    },
+                    NULL,
+                    &vc->mem);
+
+   r = vkMapMemory(vc->device, vc->mem, 0, mem_size, 0, &vc->map);
+   if (r != VK_SUCCESS)
+      fail("vkMapMemory failed");
+   memcpy(vc->map + vc->vertex_offset, vVertices, sizeof(vVertices));
+   memcpy(vc->map + vc->colors_offset, vColors, sizeof(vColors));
+   memcpy(vc->map + vc->normals_offset, vNormals, sizeof(vNormals));
+
+   vkBindBufferMemory(vc->device, vc->buffer, vc->mem, 0);
+
+   VkDescriptorPool desc_pool;
+   const VkDescriptorPoolCreateInfo create_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+      .pNext = NULL,
+      .flags = 0,
+      .maxSets = 1,
+      .poolSizeCount = 1,
+      .pPoolSizes = (VkDescriptorPoolSize[]) {
+         {
+            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1
+         },
+      }
+   };
+
+   vkCreateDescriptorPool(vc->device, &create_info, NULL, &desc_pool);
+
+   vkAllocateDescriptorSets(vc->device,
+      &(VkDescriptorSetAllocateInfo) {
+         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+         .descriptorPool = desc_pool,
+         .descriptorSetCount = 1,
+         .pSetLayouts = &set_layout,
+      }, &vc->descriptor_set);
+
+   vkUpdateDescriptorSets(vc->device, 1,
+                          (VkWriteDescriptorSet []) {
+                             {
+                                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                .dstSet = vc->descriptor_set,
+                                .dstBinding = 0,
+                                .dstArrayElement = 0,
+                                .descriptorCount = 1,
+                                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                .pBufferInfo = &(VkDescriptorBufferInfo) {
+                                   .buffer = vc->buffer,
+                                   .offset = 0,
+                                   .range = sizeof(struct ubo),
+                                }
+                             }
+                          },
+                          0, NULL);
+}
+
+static void
+render_cube(struct vkcube *vc, struct vkcube_buffer *b, bool wait_semaphore)
+{
+   struct ubo ubo;
+   struct timeval tv;
+   uint64_t t;
+
+   gettimeofday(&tv, NULL);
+
+   t = ((tv.tv_sec * 1000 + tv.tv_usec / 1000) -
+        (vc->start_tv.tv_sec * 1000 + vc->start_tv.tv_usec / 1000)) / 5;
+
+   esMatrixLoadIdentity(&ubo.modelview);
+   esTranslate(&ubo.modelview, 0.0f, 0.0f, -8.0f);
+   esRotate(&ubo.modelview, 45.0f + (0.25f * t), 1.0f, 0.0f, 0.0f);
+   esRotate(&ubo.modelview, 45.0f - (0.5f * t), 0.0f, 1.0f, 0.0f);
+   esRotate(&ubo.modelview, 10.0f + (0.15f * t), 0.0f, 0.0f, 1.0f);
+
+   float aspect = (float) vc->height / (float) vc->width;
+   ESMatrix projection;
+   esMatrixLoadIdentity(&projection);
+   esFrustum(&projection, -2.8f, +2.8f, -2.8f * aspect, +2.8f * aspect, 6.0f, 10.0f);
+
+   esMatrixLoadIdentity(&ubo.modelviewprojection);
+   esMatrixMultiply(&ubo.modelviewprojection, &ubo.modelview, &projection);
+
+   /* The mat3 normalMatrix is laid out as 3 vec4s. */
+   memcpy(ubo.normal, &ubo.modelview, sizeof ubo.normal);
+
+   memcpy(vc->map, &ubo, sizeof(ubo));
+
+   vkWaitForFences(vc->device, 1, &b->fence, VK_TRUE, UINT64_MAX);
+   vkResetFences(vc->device, 1, &b->fence);
+
+   vkBeginCommandBuffer(b->cmd_buffer,
+                        &(VkCommandBufferBeginInfo) {
+                           .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                           .flags = 0
+                        });
+
+   vkCmdBeginRenderPass(b->cmd_buffer,
+                        &(VkRenderPassBeginInfo) {
+                           .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                           .renderPass = vc->render_pass,
+                           .framebuffer = b->framebuffer,
+                           .renderArea = { { 0, 0 }, { vc->width, vc->height } },
+                           .clearValueCount = 1,
+                           .pClearValues = (VkClearValue []) {
+                              { .color = { .float32 = { 0.2f, 0.2f, 0.2f, 1.0f } } }
+                           }
+                        },
+                        VK_SUBPASS_CONTENTS_INLINE);
+
+   vkCmdBindVertexBuffers(b->cmd_buffer, 0, 3,
+                          (VkBuffer[]) {
+                             vc->buffer,
+                             vc->buffer,
+                             vc->buffer
+                          },
+                          (VkDeviceSize[]) {
+                             vc->vertex_offset,
+                             vc->colors_offset,
+                             vc->normals_offset
+                           });
+
+   vkCmdBindPipeline(b->cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vc->pipeline);
+
+   vkCmdBindDescriptorSets(b->cmd_buffer,
+                           VK_PIPELINE_BIND_POINT_GRAPHICS,
+                           vc->pipeline_layout,
+                           0, 1,
+                           &vc->descriptor_set, 0, NULL);
+
+   const VkViewport viewport = {
+      .x = 0,
+      .y = 0,
+      .width = vc->width,
+      .height = vc->height,
+      .minDepth = 0,
+      .maxDepth = 1,
+   };
+   vkCmdSetViewport(b->cmd_buffer, 0, 1, &viewport);
+
+   const VkRect2D scissor = {
+      .offset = { 0, 0 },
+      .extent = { vc->width, vc->height },
+   };
+   vkCmdSetScissor(b->cmd_buffer, 0, 1, &scissor);
+
+   vkCmdDraw(b->cmd_buffer, 4, 1, 0, 0);
+   vkCmdDraw(b->cmd_buffer, 4, 1, 4, 0);
+   vkCmdDraw(b->cmd_buffer, 4, 1, 8, 0);
+   vkCmdDraw(b->cmd_buffer, 4, 1, 12, 0);
+   vkCmdDraw(b->cmd_buffer, 4, 1, 16, 0);
+   vkCmdDraw(b->cmd_buffer, 4, 1, 20, 0);
+
+   vkCmdEndRenderPass(b->cmd_buffer);
+
+   vkEndCommandBuffer(b->cmd_buffer);
+
+   VkProtectedSubmitInfo protected_info = {
+      .sType = VK_STRUCTURE_TYPE_PROTECTED_SUBMIT_INFO,
+      .protectedSubmit = vc->protected_en,
+   };
+
+   vkQueueSubmit(vc->queue, 1,
+      &(VkSubmitInfo) {
+         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+         .pNext = &protected_info,
+         /* headless mode does not signal vc->semaphore */
+         .waitSemaphoreCount = wait_semaphore ? 1 : 0,
+         .pWaitSemaphores = &vc->semaphore,
+         .pWaitDstStageMask = (VkPipelineStageFlags []) {
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+         },
+         .commandBufferCount = 1,
+         .pCommandBuffers = &b->cmd_buffer,
+      }, b->fence);
+}
+
+struct model cube_model = {
+   .init = init_cube,
+   .render = render_cube
+};
